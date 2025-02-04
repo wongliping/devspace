@@ -8,7 +8,7 @@ metadata:
   name: rayservice-sample
 spec:
   # serveConfigV2 takes a yaml multi-line scalar, which should be a Ray Serve multi-application config. See https://docs.ray.io/en/latest/serve/multi-app.html.
-  # conda zip: https://raw.githubusercontent.com/wongliping/devspace/refs/heads/main/rayserve/rayserve-conda.zip
+  # conda zip: https://raw.githubusercontent.com/wongliping/devspace/refs/heads/main/rayserve/conda/rayserve-conda.zip
   serveConfigV2: |
     applications:
       - name: fruit_app
