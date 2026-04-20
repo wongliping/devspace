@@ -1,0 +1,161 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'REPO_ID',      defaultValue: '',        description: 'Hugging Face repo ID, e.g. moonshotai/Kimi-K2.5')
+        string(name: 'OUTPUT_DIR',   defaultValue: './out', description: 'Local output root; model files go to OUTPUT_DIR/model, manifests to OUTPUT_DIR/results')
+        string(name: 'INCLUDE',      defaultValue: '',        description: 'Space-separated glob patterns to include, e.g. "*.safetensors config.json"')
+        string(name: 'EXCLUDE',      defaultValue: '',        description: 'Space-separated glob patterns to exclude, e.g. "*.bin original/*"')
+        string(name: 'PROXY',        defaultValue: '',        description: 'Proxy URL, e.g. http://proxy.corp.com:8080')
+        string(name: 'JFROG_URL',    defaultValue: '',        description: 'JFrog Artifactory base URL, e.g. https://artifactory.corp.com/artifactory')
+        string(name: 'JFROG_REPO',   defaultValue: '',        description: 'Target Artifactory repository, e.g. ml-models-local')
+        string(name: 'JFROG_TARGET_PATH', defaultValue: '',   description: 'Target path prefix within the repo, e.g. huggingface/moonshotai/Kimi-K2.5')
+    }
+
+    environment {
+        HF_TOKEN      = credentials('hf-token')
+        PROXY_USER    = credentials('proxy-user')
+        PROXY_PASS    = credentials('proxy-password')
+        JFROG_CREDS   = credentials('jfrog-credentials')   // sets JFROG_CREDS_USR and JFROG_CREDS_PSW
+    }
+
+    stages {
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.REPO_ID?.trim()) {
+                        error 'REPO_ID is required'
+                    }
+                }
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                sh 'pip install --quiet huggingface_hub requests'
+            }
+        }
+
+        stage('Download') {
+            steps {
+                script {
+                    def cmd = ['python3', 'download_model.py', params.REPO_ID,
+                               '--output-dir', params.OUTPUT_DIR]
+
+                    if (params.INCLUDE?.trim()) {
+                        cmd += ['--include'] + params.INCLUDE.trim().split('\\s+').toList()
+                    }
+                    if (params.EXCLUDE?.trim()) {
+                        cmd += ['--exclude'] + params.EXCLUDE.trim().split('\\s+').toList()
+                    }
+                    if (params.PROXY?.trim()) {
+                        cmd += ['--proxy', params.PROXY.trim(),
+                                '--proxy-user',     env.PROXY_USER,
+                                '--proxy-password', env.PROXY_PASS]
+                    }
+
+                    withEnv(["HUGGING_FACE_HUB_TOKEN=${env.HF_TOKEN}"]) {
+                        sh cmd.join(' ')
+                    }
+                }
+            }
+        }
+
+        stage('Upload to JFrog') {
+            when {
+                expression { params.JFROG_URL?.trim() && params.JFROG_REPO?.trim() }
+            }
+            steps {
+                script {
+                    def downloadedTxt = "${params.OUTPUT_DIR}/results/downloaded.txt"
+                    if (!fileExists(downloadedTxt)) {
+                        error "downloaded.txt not found at ${downloadedTxt}"
+                    }
+
+                    def targetPrefix = params.JFROG_TARGET_PATH?.trim()
+                        ? "${params.JFROG_REPO}/${params.JFROG_TARGET_PATH}/"
+                        : "${params.JFROG_REPO}/"
+
+                    def files = readFile(downloadedTxt).trim().split('\n')
+                    def uploaded = []
+                    def uploadFailed = []
+
+                    files.each { filePath ->
+                        filePath = filePath.trim()
+                        if (!filePath) return
+
+                        def fileName = filePath.tokenize('/').last()
+                        def targetUrl = "${params.JFROG_URL}/${targetPrefix}${fileName}"
+
+                        def status = sh(
+                            script: """curl -s -o /dev/null -w "%{http_code}" \
+                                -u "${env.JFROG_CREDS_USR}:${env.JFROG_CREDS_PSW}" \
+                                -T "${filePath}" \
+                                "${targetUrl}" """,
+                            returnStdout: true
+                        ).trim()
+
+                        if (status ==~ /2\d\d/) {
+                            echo "Uploaded: ${filePath} -> ${targetUrl}"
+                            uploaded << targetUrl
+                        } else {
+                            echo "FAILED (HTTP ${status}): ${filePath}"
+                            uploadFailed << "${filePath} [HTTP ${status}]"
+                        }
+                    }
+
+                    writeFile file: "${params.OUTPUT_DIR}/results/uploaded.txt",
+                              text: uploaded.join('\n')
+                    writeFile file: "${params.OUTPUT_DIR}/results/upload_failed.txt",
+                              text: uploadFailed.join('\n')
+
+                    if (uploadFailed) {
+                        error "Upload failed for ${uploadFailed.size()} file(s):\n${uploadFailed.join('\n')}"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def resultsDir = "${params.OUTPUT_DIR}/results"
+
+                def readOptional = { path ->
+                    fileExists(path) ? readFile(path).trim() : ''
+                }
+
+                def toList = { text ->
+                    text ? text.split('\n').findAll { it.trim() } : []
+                }
+
+                def downloaded   = toList(readOptional("${resultsDir}/downloaded.txt"))
+                def dlFailed     = toList(readOptional("${resultsDir}/failed.txt"))
+                def uploaded     = toList(readOptional("${resultsDir}/uploaded.txt"))
+                def uploadFailed = toList(readOptional("${resultsDir}/upload_failed.txt"))
+
+                def sep = '=' * 60
+                def report = """
+${sep}
+PIPELINE REPORT — ${params.REPO_ID}
+${sep}
+DOWNLOAD
+  Succeeded : ${downloaded.size()}
+  Failed    : ${dlFailed.size()}
+${downloaded   ? '\nDownloaded files:\n  ' + downloaded.join('\n  ')   : ''}
+${dlFailed     ? '\nFailed downloads:\n  ' + dlFailed.join('\n  ')     : ''}
+${sep}
+UPLOAD TO JFROG
+${(params.JFROG_URL?.trim() && params.JFROG_REPO?.trim()) ? """\
+  Succeeded : ${uploaded.size()}
+  Failed    : ${uploadFailed.size()}
+${uploaded     ? '\nUploaded files:\n  ' + uploaded.join('\n  ')       : ''}
+${uploadFailed ? '\nFailed uploads:\n  ' + uploadFailed.join('\n  ')   : ''}""" : '  Skipped (JFROG_URL / JFROG_REPO not set)'}
+${sep}
+"""
+                echo report
+            }
+        }
+    }
+}
