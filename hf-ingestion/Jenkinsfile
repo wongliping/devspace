@@ -80,12 +80,16 @@ pipeline {
                     def uploaded = []
                     def uploadFailed = []
 
+                    def modelDir = sh(script: "realpath '${params.OUTPUT_DIR}/model'", returnStdout: true).trim() + '/'
+
                     files.each { filePath ->
                         filePath = filePath.trim()
                         if (!filePath) return
 
-                        def fileName = filePath.tokenize('/').last()
-                        def targetUrl = "${params.JFROG_URL}/${targetPrefix}${fileName}"
+                        def relativePath = filePath.startsWith(modelDir)
+                            ? filePath.substring(modelDir.length())
+                            : filePath.tokenize('/').last()
+                        def targetUrl = "${params.JFROG_URL}/${targetPrefix}${relativePath}"
 
                         def status = sh(
                             script: """curl -s -o /dev/null -w "%{http_code}" \
@@ -96,7 +100,7 @@ pipeline {
                         ).trim()
 
                         if (status ==~ /2\d\d/) {
-                            echo "Uploaded: ${filePath} -> ${targetUrl}"
+                            echo "Uploaded: ${relativePath} -> ${targetUrl}"
                             uploaded << targetUrl
                         } else {
                             echo "FAILED (HTTP ${status}): ${filePath}"
