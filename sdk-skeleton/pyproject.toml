@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=70.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eval-builder-runner"
+dynamic = ["version"]
+description = "SDK for building and running evaluations."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }  # TODO: choose a license
+dependencies = [
+    "pydantic>=2.6,<3",
+]
+
+[project.urls]
+# TODO: fill in once the repo exists
+# Homepage = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "pyright>=1.1.380",
+    "setuptools>=70.1",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "eval_builder_runner._version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+eval_builder_runner = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --cov=eval_builder_runner --cov-report=term-missing --cov-report=xml:coverage.xml"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "N", "RUF", "ANN", "S", "PT", "TID", "D"]
+ignore = ["D107", "ANN401"]  # Any is legitimate for arbitrary task outputs
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "D"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.10"
