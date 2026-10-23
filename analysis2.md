@@ -1,6 +1,6 @@
 # Vertex AI endpoint observability without console access
 
-**Status:** Analysis complete. Recommendation proposed, pending the on-prem spike.
+**Status:** Analysis complete. Recommendation updated for the existing GCP OTel Collector, Elasticsearch and Kibana; pending confirmation from that stack's owners and the on-prem spike for B.
 **Date:** 2026-10-23
 **Scope:** Logs and operational metrics for Vertex AI online prediction endpoints (`mle-project-496007`, `us-central1`), delivered to users who have no GCP console access.
 **Related:** [Logging-cost levers](2026-09-09-vertex-logging-cost.md) · [Exclusion + GCS sink runbook](logs-exclusion-gcs-sink.md) · [Endpoint access control](superpowers/specs/2026-09-24-endpoint-access-control-design.md)
@@ -9,41 +9,44 @@
 
 ## 1. Summary
 
-Today, the only way to see endpoint logs and metrics is the GCP console under *Vertex AI → Endpoints*. Users, including engineers on consuming teams, will not get console access. We need another way to retrieve and render this data that fits a **one-way network** (on-prem → GCP only) and reuses the **existing on-prem Grafana, Prometheus and Thanos stack**.
+Today, the only way to see endpoint logs and metrics is the GCP console under *Vertex AI → Endpoints*. Users, including engineers on consuming teams, will not get console access. We need another way to retrieve and render this data that:
+- fits a **one-way network** (on-prem → GCP only);
+- reuses what already exists: the **on-prem Grafana, Prometheus and Thanos stack**, and the **OTel Collector, Elasticsearch and Kibana already running in GCP**.
 
 **Recommendation:**
 
 | Signal | Approach | Why |
 |---|---|---|
 | **Metrics** | **Option B:** on-prem Grafana queries Cloud Monitoring with PromQL | Near-zero build, pull-only, built-in metrics are free to ingest. Proven locally |
-| **Logs** | **Option D:** Log Router sink → Pub/Sub → on-prem Alloy (pull) → Loki | Avoids the hard 60 req/min read quota, keeps PII scoped per team, ≈ $7 per 100 GiB |
-| **Custom model metrics** | **Defer.** When needed: OTel SDK → OTLP → Cloud Monitoring | Sample-based billing is ~25× cheaper for histograms. Shows up in B with no new infrastructure |
-| **Portal** | Link out to Grafana dashboards; don't rebuild charts | Grafana already does it, with alerting |
+| **Logs** | **Option E-hybrid on the existing stack:** Log Router sink → Pub/Sub → **existing OTel Collector** → **existing Elasticsearch**. Search in the **existing Kibana**, scoped per team, with optional log panels in the on-prem Grafana | No new platform, logs never leave GCP, Pub/Sub buffers outages, every container log line is captured, no predictor code change, no 60 req/min quota |
+| **Custom model metrics** | **Defer.** When needed: OTel SDK → OTLP → Cloud Monitoring (visible in B), or to the existing collector if Kibana is the main UI | Sample-based billing is ~25× cheaper for histograms than byte-based |
+| **Portal** | Deep links or embeds of Kibana and Grafana. A native portal log view can query Elasticsearch with per-team API keys | No quota-bound `entries.list`; no rebuilding of charts |
 
-**Alternative (option E, §4.5):** run the whole stack in GCP: an OTel Collector, ELK and a GCP-hosted Grafana, which users open in their browser.
-- **For:** nothing is installed on-prem, no data leaves GCP, and no key files are needed.
-- **Against:** a new platform to operate, Elasticsearch as the dominant cost, and a Grafana separate from the on-prem one.
-- **Preferred shape:** in its "E-hybrid" form, metrics stay on Cloud Monitoring via PromQL and Elasticsearch holds logs only.
+- **Fallback for logs: option D** (Pub/Sub → Alloy → on-prem Loki), if the existing Elasticsearch can't take the volume or tenancy, or if logs must be searchable from the on-prem stack only.
+- **Not recommended: variant E-direct** (predictor sends OTLP straight to the collector, no Pub/Sub). It loses crash, OOM and startup logs, has no outage buffer, and needs code changes in every predictor.
 
 ```mermaid
 flowchart LR
     subgraph gcp["GCP"]
         V["Vertex AI endpoint"] -->|"built-in metrics (free)"| CM[("Cloud Monitoring")]
-        V -.->|"custom metrics via OTLP (later)"| CM
         V -->|"stdout / stderr"| LR["Log Router"] -->|"Pub/Sub sink"| PS[["Pub/Sub<br/>pull subscription"]]
         LR -->|"GCS sink"| GCS[("GCS archive")]
+        PS -->|"googlecloudpubsub receiver"| OC["Existing OTel Collector"]
+        OC -->|"elasticsearch exporter<br/>per-team data streams"| ES[("Existing Elasticsearch")]
+        ES --- KB["Existing Kibana<br/>Space per team"]
     end
     subgraph onprem["On-prem"]
         G["Grafana"]
-        AL["Grafana Alloy"] --> LK[("Loki")] --> G
+        U["Users"]
     end
     G -->|"B: PromQL, outbound"| CM
-    AL -->|"D: pull, outbound"| PS
+    U -->|"browser, outbound HTTPS"| KB
+    G -.->|"optional: Elasticsearch datasource"| ES
 ```
 
-**The single most important lever isn't a tool choice:** cut log volume at the source (log level, no payload logging, no health-probe lines). It improves cost, quota headroom, PII exposure, Loki capacity and search quality at the same time.
+**The single most important lever isn't a tool choice:** cut log volume at the source (log level, no payload logging, no health-probe lines). It improves cost, quota headroom, PII exposure, Elasticsearch storage and search quality at the same time.
 
-**Indicative running cost** (list prices, a 20-endpoint fleet, 100 GiB of logs per month after source reduction): **≈ $35–$85/month**, dominated by dashboard reads and `_Default` storage. Details are in §6.
+**Indicative incremental running cost** (list prices, a 20-endpoint fleet, 100 GiB of logs per month after source reduction): **≈ $35–$85/month** on GCP services, dominated by dashboard reads and `_Default` storage (Pub/Sub ≈ $7, GCS ≈ $2), **plus the share of the existing Elasticsearch cluster's storage** (unverified; set by retention). There's no GCP → on-prem egress for logs. Details are in §6.
 
 ---
 
@@ -57,7 +60,7 @@ flowchart LR
 | R2 | Users can search the prediction container's logs for their own models |
 | R3 | Access is scoped per team or model; logs can contain PII (`race`, `sex`, `marital_status`, … in the census payload) |
 | R4 | Works over a **one-way** network: on-prem can reach Google APIs through a per-destination firewall whitelist; GCP cannot initiate connections to on-prem |
-| R5 | Reuses the existing on-prem **Grafana + Prometheus + Thanos** stack where possible |
+| R5 | Reuses existing platforms where possible: on-prem **Grafana + Prometheus + Thanos**, and the GCP-hosted **OTel Collector + Elasticsearch + Kibana** |
 | R6 | Predictable cost, including at high cardinality and with many viewers |
 
 ### 2.2 The two APIs everything sits on
@@ -138,7 +141,7 @@ flowchart LR
 | **B** Grafana → Cloud Monitoring | Metrics | On-prem Grafana queries Cloud Monitoring live with PromQL | **Low** |
 | **C** Exporter → Thanos | Metrics | An on-prem exporter polls Cloud Monitoring into Prometheus/Thanos | Medium |
 | **D** Sink → Pub/Sub → Loki | Logs | A Log Router sink streams logs to Pub/Sub; on-prem Alloy pulls them into Loki | Medium |
-| **E** All-in-GCP stack | Metrics + logs | OTel Collector, ELK and Grafana all run in GCP; users browse to Grafana/Kibana. Logs go to Elasticsearch; metrics are read from Cloud Monitoring (E-hybrid) or Elasticsearch | Medium–High |
+| **E** GCP stack (**existing** collector, Elasticsearch, Kibana) | Logs (+ metrics) | Logs: Pub/Sub → existing collector → existing Elasticsearch, searched in Kibana. Metrics stay on B (E-hybrid) or go to Elasticsearch. Variant E-direct skips Pub/Sub | **Low–Medium** (hybrid on existing stack) |
 
 ### 4.1 Option A: portal UI on the Logging and Monitoring APIs
 
@@ -213,7 +216,7 @@ flowchart LR
 
 A variant (C2) puts an OTel Collector in GCP behind a public authenticated `/metrics` endpoint, scraped by on-prem Prometheus (outbound from on-prem). It's only worth it if custom metrics must bypass Cloud Monitoring entirely, which no current requirement needs.
 
-### 4.4 Option D: Log Router sink → Pub/Sub → on-prem Loki (recommended for logs)
+### 4.4 Option D: Log Router sink → Pub/Sub → on-prem Loki (fallback for logs)
 
 A **Log Router sink** streams matching Vertex log entries into a Pub/Sub topic. On-prem **Grafana Alloy** pulls from a subscription (outbound only) and writes to Loki. Users search logs in the existing Grafana, scoped by Loki tenant.
 
@@ -241,7 +244,9 @@ flowchart LR
 
 Implementation steps and commands are in [Appendix A](#appendix-a--option-d-setup).
 
-### 4.5 Option E: self-contained observability stack in GCP (OTel Collector + ELK + Grafana)
+### 4.5 Option E: observability stack in GCP (OTel Collector + ELK + Grafana)
+
+> **Update: the OTel Collector, Elasticsearch and Kibana already exist in GCP.** E's main drawbacks below (*"a new platform to operate"*, *"Elasticsearch cost dominates"*) mostly fall away: the platform, its owners and its cost base exist already. The remaining work is the sink, Pub/Sub, a collector pipeline and per-team data streams. The recommended shape is **E-hybrid with the on-prem Grafana**: logs flow through Pub/Sub → existing collector → existing Elasticsearch, users search in Kibana, and metrics stay on B. A GCP-hosted Grafana is optional, not required.
 
 The **whole stack runs in GCP**: an OpenTelemetry Collector, Elasticsearch, Kibana (plus Logstash if wanted), and a **GCP-hosted Grafana** that reads Elasticsearch through its Elasticsearch datasource. Nothing is installed on-prem. Users open Grafana or Kibana in their browser, which is an ordinary outbound HTTPS request from on-prem, so R4 holds without any data leaving GCP.
 
@@ -360,7 +365,7 @@ flowchart LR
         subgraph vtx["Vertex AI endpoint"]
             PR["Predictor container<br/>OTel SDK: logs + custom metrics"]
         end
-        PR -->|"OTLP/HTTP :4318 (http/protobuf)"| OC["OTel Collector<br/>otlp receiver, HTTP :4318 only"]
+        PR -->|"OTLP/HTTP :4318 (http/protobuf)<br/>internal LB / authenticated URL"| OC["OTel Collector<br/>otlp receiver, HTTP :4318 only"]
         VB["Vertex built-in metrics"] --> CM[("Cloud Monitoring")]
         CM -->|"googlecloudmonitoring receiver"| OC
         OC -->|"elasticsearch exporter"| ES[("Elasticsearch")]
@@ -407,18 +412,28 @@ flowchart LR
 
 ## 5. Evaluation
 
-| Criterion | A Portal | B Grafana → CM | C Exporter → Thanos | D Sink → Loki | E All-in-GCP (hybrid) |
-|---|---|---|---|---|---|
-| R1 Endpoint health | ✅ | ✅ | ✅ | n/a | ✅ (PromQL via Cloud Monitoring) |
-| R2 Log search | ⚠️ quota-bound | ❌ (by design) | ❌ | ✅ | ✅ |
-| R3 Per-team scoping | ✅ fine-grained | ⚠️ folder-level | ⚠️ folder-level | ✅ Loki tenant | ✅ per-team indices |
-| R4 One-way network | ✅ | ✅ | ✅ | ✅ | ✅ browsers only; no data egress |
-| R5 Reuse on-prem stack | ❌ | ✅ | ✅ | ✅ | ❌ new stack in GCP |
-| R6 Predictable cost | ✅ if cached | ⚠️ grows with viewers | ✅ fixed polling | ✅ volume-based | ⚠️ Elasticsearch, Grafana and load balancer to run |
-| Build effort | High | **Low** | Medium | Medium | Medium–High |
-| Freshness | ~2–3 min / seconds | ~2–3 min | 5–8 min | Seconds | Logs: seconds; metrics: ~2–3 min |
+With the GCP-hosted OTel Collector, Elasticsearch and Kibana already in place, the log options compare as follows. Metrics are B in every row of the recommendation.
 
-B and D together cover every requirement with the least new code. C is the upgrade path for metrics if R6 starts to bite or long retention is required. E is the alternative to B + D when observability for GCP workloads should live entirely in GCP and a team will own Elasticsearch and Grafana there.
+| Criterion | A Portal | B Grafana → CM | C Exporter → Thanos | D Sink → Loki | **E-hybrid on existing ELK** | E-direct |
+|---|---|---|---|---|---|---|
+| R1 Endpoint health | ✅ | ✅ | ✅ | n/a | ✅ via B (PromQL) | ⚠️ in Elasticsearch, no PromQL |
+| R2 Log search | ⚠️ quota-bound | ❌ by design | ❌ | ✅ Grafana/Loki | ✅ Kibana (+ Grafana) | ✅ Kibana; ⚠️ misses crash/OOM/startup logs |
+| R3 Per-team scoping | ✅ fine-grained | ⚠️ folder-level | ⚠️ folder-level | ✅ Loki tenant | ✅ data stream + role/Space per team | ✅ same |
+| R4 One-way network | ✅ | ✅ | ✅ | ✅ | ✅ logs stay in GCP; users browse outbound | ⚠️ Vertex → collector egress unverified |
+| R5 Reuse existing platforms | ❌ | ✅ | ✅ | ✅ if Loki exists | ✅ **existing collector, Elasticsearch, Kibana** | ✅ same |
+| R6 Predictable cost | ✅ if cached | ⚠️ grows with viewers | ✅ fixed polling | ✅ volume-based + on-prem storage | ✅ Pub/Sub volume + incremental ES storage | ✅ lowest GCP cost |
+| Outage buffer | n/a | n/a | n/a | ✅ Pub/Sub 7 d | ✅ Pub/Sub 7 d | ❌ collector queue only |
+| Predictor code change | none | none | none | none | **none** | every predictor (OTel SDK) |
+| PII location | GCP | n/a | n/a | **copied on-prem** | **stays in GCP** | stays in GCP |
+| New components | portal UI | datasource | exporter | Alloy (+ Loki) | sink, topic, collector pipeline | collector endpoint, SDKs |
+| Build effort | High | **Low** | Medium | Medium | **Low–Medium** | Medium–High |
+| Freshness | ~2–3 min / s | ~2–3 min | 5–8 min | Seconds | Seconds | Seconds |
+
+**Reading the table:**
+- **B + E-hybrid** covers every requirement with the least new infrastructure. It reuses both existing platforms, keeps PII in GCP, and keeps Pub/Sub's buffer and full container-log capture.
+- **D** loses its main advantage, reusing on-prem Loki, unless Loki already exists there. It also adds a bulk PII copy on-prem and an egress path. It remains the fallback.
+- **E-direct** is the only option that gives up container-level logs and the outage buffer. That trade isn't justified while a Pub/Sub path is available.
+- **C** remains the metrics upgrade path if B's read cost grows with viewers or retention beyond 24 months is required.
 
 ---
 
@@ -459,12 +474,13 @@ Server-side aggregation, minimum intervals and refresh limits are therefore **de
 
 At 100 GiB/month of endpoint logs:
 
-| Item | `_Default` only | + Pub/Sub → Loki | + full `_Default` exclusion |
+| Item | `_Default` only | + Pub/Sub → Elasticsearch (or Loki) | + full `_Default` exclusion |
 |---|---|---|---|
 | `_Default` storage | ≈ $25–50 (depends on the 50 GiB per-project free tier) | Same | $0 |
 | Pub/Sub delivery (≈ 200 GiB of throughput) | n/a | ≈ $7.4 | ≈ $7.4 |
 | GCS archive (Standard, regional) | n/a | ≈ $2 per month of data kept, before lifecycle tiering | Same |
-| GCP → on-prem egress | n/a | Unverified | Unverified |
+| GCP → on-prem egress | n/a | None with Elasticsearch in GCP; unverified for Loki (D) | Same |
+| Elasticsearch storage (existing cluster) | n/a | Incremental share, set by retention and ILM; unverified | Same |
 
 Source reduction (§7.1) is worth more than any of these: the earlier work showed idle probe noise alone can dominate volume.
 
@@ -526,7 +542,7 @@ Rules that hold at every stage:
 
 ## 8. Data protection and residency
 
-- **Every copy is a governed copy.** `_Default`, GCS, Pub/Sub and Loki each need IAM, retention and a location. A deletion request spans all four. Minimising at the source (§7.2, stage 1) is the only control that reduces all of them.
+- **Every copy is a governed copy.** `_Default`, GCS, Pub/Sub and Elasticsearch (or Loki, under fallback D) each need IAM, retention and a location. A deletion request spans all four. With E-hybrid, every copy stays in GCP. Minimising at the source (§7.2, stage 1) is the only control that reduces all of them.
 - **Least-privilege identities:**
   - Sink writer: `pubsub.publisher` on one topic.
   - On-prem consumer: `pubsub.subscriber` on one subscription.
@@ -542,7 +558,7 @@ Rules that hold at every stage:
 - **Retention obligations:**
   - Pub/Sub (7 days) and `_Default` (30 days) aren't archives.
   - Any multi-year requirement is met by the GCS bucket's lifecycle and retention lock.
-- **Loki tenancy:** one tenant (or label-based access policy) per team, so R3 holds on the log path without per-request authorization code.
+- **Per-team log access:** in Elasticsearch, use one data stream per team with index-privilege roles and a Kibana Space per team. Under fallback D, use one Loki tenant per team instead. Either way, R3 holds on the log path without per-request authorization code.
 
 ---
 
@@ -570,28 +586,30 @@ A code sketch is in [Appendix C](#appendix-c--otlp-custom-metric-sketch).
 
 ## 10. Recommendation and rollout
 
+**Recommended: B for metrics + E-hybrid on the existing GCP OTel Collector, Elasticsearch and Kibana for logs.**
+
 | Phase | Scope | Exit criteria |
 |---|---|---|
 | **0. Source reduction** (days) | Stage 1 of §7.2 on every predictor: quiet logging, no payloads | `discover.py` shows probe/access lines gone; bytes/hour measured before and after |
-| **1. Metrics via B** (days) | Read-only service account, firewall entry, Grafana datasource, a per-team dashboard template | On-prem Grafana shows p95 latency, prediction rate and error rate for one endpoint; billed series per refresh recorded |
+| **1. Metrics via B** (days) | Read-only service account, firewall entry, on-prem Grafana datasource, a per-team dashboard template | On-prem Grafana shows p95 latency, prediction rate and error rate for one endpoint; billed series per refresh recorded |
 | **2. Narrow exclusion** (1 day) | Stage 2 of §7.2 | `storage_bytes` drops; app errors are still visible in Logs Explorer |
-| **3. Logs via D** (1–2 weeks incl. firewall) | Topic with storage policy, sink, pull subscription, Alloy, Loki tenants, backlog alerts | Entries reach Loki within seconds with `endpoint_id`/`level` labels; backlog drains; volume matches the estimate |
-| **4. Optional full exclusion** | Stage 4 of §7.2, after one full retention cycle on Loki | Explicit sign-off that Loki and GCS are the systems of record |
-| **Later** | Custom metrics via OTLP; move metrics to C if read cost or retention requires | A named model-quality requirement exists, or monthly read cost exceeds the agreed budget |
+| **3. Logs via the existing ELK** (≈ 1 week) | Topic with storage policy, sink, pull subscription for the collector; a `logs` pipeline on the existing collector (`googlecloudpubsub` + `googlecloudlogentry` encoding → `transform` team routing → `elasticsearch`); per-team data streams, roles and Kibana Spaces; backlog-age alert | Entries searchable in Kibana within seconds, each team sees only its own data stream, backlog drains, Elasticsearch storage/day matches the estimate |
+| **4. Optional full exclusion** | Stage 4 of §7.2, after one full retention cycle on Elasticsearch | Explicit sign-off that Elasticsearch and GCS are the systems of record |
+| **Later** | Custom metrics via OTLP; on-prem Grafana Elasticsearch datasource for log panels next to metrics; portal log view via the Elasticsearch API; move metrics to C if read cost or retention requires | A named need for each |
 
-**If option E is chosen instead:**
-- Phase 0 and Phase 2 are unchanged.
-- On the GCP side, Phase 3 keeps the sink and the topic with its storage policy, plus a pull subscription for the collector.
-- Phases 1 and 3 are replaced by six steps:
-  1. Provision Elasticsearch and Kibana in GCP.
-  2. Deploy Grafana in GCP (Cloud SQL backend) with the Cloud Monitoring and Elasticsearch datasources.
-  3. Deploy the collector (2+ replicas).
-  4. Set up per-team data streams and API keys.
-  5. Expose Grafana and Kibana through an HTTPS load balancer with Cloud Armor and ADA SSO.
-  6. Add the single user-facing firewall entry on-prem.
-- Exit criteria: users log in through ADA SSO and see only their team's logs and endpoint metrics. No data flows to on-prem.
+**Preconditions to confirm with the owners of the existing stack:**
+- **Collector:** its build includes the contrib `googlecloudpubsub` receiver and the `googlecloudlogentry` encoding extension. The built-in `cloud_logging` encoding was removed in v0.132.0. Its service account can be granted `pubsub.subscriber` on the new subscription.
+- **Elasticsearch:**
+  - Capacity for the added ingest and retention.
+  - Version ≥ 8.12 for the exporter's default `otel` mapping.
+  - Per-team roles and Kibana Spaces are acceptable under the current licence.
+- **Access:**
+  - Kibana is already reachable from on-prem browsers with corporate SSO, or can be.
+  - If on-prem Grafana panels are wanted, the Elasticsearch endpoint can also be reached from on-prem.
 
-The portal links to the relevant Grafana dashboard and Loki query per model rather than embedding charts. A small aggregated in-portal summary can come later if non-technical users need it. It should be built on cached, aggregated `timeSeries.list` calls, never raw `entries.list`.
+**Fallback:** if any precondition fails, use D (Alloy → on-prem Loki) for logs, with the Phase 3 GCP-side steps unchanged up to the subscription.
+
+The portal links to the Kibana Space and Grafana dashboard for each model rather than rebuilding charts. A native in-portal log view, if wanted, queries Elasticsearch with per-team API keys, never `entries.list`.
 
 ---
 
@@ -606,6 +624,9 @@ The portal links to the relevant Grafana dashboard and Loki query per model rath
 | Free allotments consumed by other projects on the billing account | Costs higher than estimated | Check billing account usage |
 | Logs-based metrics and excluded entries | A log-derived alert might silently stop counting | Verify before relying on any user-defined logs-based metric |
 | `sample()` and noise exclusions dropping something needed | Missing evidence in an incident | Never sample WARNING and above; GCS holds everything |
+| **Shared Elasticsearch capacity and tenancy** | Endpoint logs compete with existing workloads; noisy ingest can affect other tenants | Agree ingest/retention budget and ILM policy with the owners; per-team data streams |
+| **Existing collector** lacks the contrib receivers, or is shared with other pipelines | Phase 3 blocked, or a log pipeline failure affects other signals | Dedicated pipeline (or collector instance) for Vertex logs; pin the version; alert on backlog age |
+| Kibana SSO / per-team Spaces under the current Elastic licence | R3 enforcement | Confirm with the Elastic owners before Phase 3 |
 
 ---
 
