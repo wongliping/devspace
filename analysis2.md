@@ -360,7 +360,7 @@ flowchart LR
         subgraph vtx["Vertex AI endpoint"]
             PR["Predictor container<br/>OTel SDK: logs + custom metrics"]
         end
-        PR -->|"OTLP/HTTP :4318 (http/protobuf)<br/>internal LB / authenticated URL"| OC["OTel Collector<br/>otlp receiver, HTTP :4318 only"]
+        PR -->|"OTLP/HTTP :4318 (http/protobuf)"| OC["OTel Collector<br/>otlp receiver, HTTP :4318 only"]
         VB["Vertex built-in metrics"] --> CM[("Cloud Monitoring")]
         CM -->|"googlecloudmonitoring receiver"| OC
         OC -->|"elasticsearch exporter"| ES[("Elasticsearch")]
