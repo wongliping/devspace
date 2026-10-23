@@ -347,6 +347,62 @@ service:
 
 **When E beats B + D:** the organisation wants observability for GCP workloads to live **in GCP**, with no on-prem dependency, data egress or on-prem capacity ask. There's a team willing to own Elasticsearch and Grafana in GCP, and users accept a separate Grafana. If reusing the on-prem stack (R5) matters more, B + D remains the better fit.
 
+#### Variant E-direct: collector, Elasticsearch and Kibana in GCP; Grafana on-prem; no Pub/Sub
+
+Everything flows **through Elasticsearch**. There's no Log Router sink and no Pub/Sub:
+- The predictor sends **logs and custom metrics over OTLP** straight to the collector.
+- The collector polls **built-in metrics** from Cloud Monitoring.
+- The **existing on-prem Grafana** reads Elasticsearch through its Elasticsearch datasource. Kibana in GCP is optional.
+
+```mermaid
+flowchart LR
+    subgraph gcp["GCP project (us-central1)"]
+        subgraph vtx["Vertex AI endpoint"]
+            PR["Predictor container<br/>OTel SDK: logs + custom metrics"]
+        end
+        PR -->|"OTLP/HTTP :4318 (http/protobuf)<br/>internal LB / authenticated URL"| OC["OTel Collector<br/>otlp receiver, HTTP :4318 only"]
+        VB["Vertex built-in metrics"] --> CM[("Cloud Monitoring")]
+        CM -->|"googlecloudmonitoring receiver"| OC
+        OC -->|"elasticsearch exporter"| ES[("Elasticsearch")]
+        ES --- KB["Kibana"]
+        ESLB["HTTPS endpoint<br/>Egress IPs"] --> ES
+    end
+    subgraph onprem["On-prem"]
+        G["Existing Grafana<br/>Elasticsearch datasource<br/>"]
+        U["Users"] --> G
+    end
+    G -->|"outbound HTTPS<br/>one firewall entry"| FW{{"Firewall"}} --> ESLB
+```
+
+**How it differs from E and D:**
+- **Logs bypass Cloud Logging.**
+  - The predictor emits logs with the OTel logs SDK, and the deployment sets `disable_container_logging=True`.
+  - There are no sinks, no Pub/Sub, and no `_Default` cost for endpoint logs.
+  - **But** anything the SDK doesn't capture is invisible: uvicorn/startup failures before the SDK initialises, crash traces and OOM kills. Make sure the SDK's log handler is installed first thing at process start. If platform troubleshooting needs more, re-enable container logging temporarily for that endpoint.
+- **No managed buffer.**
+  - Pub/Sub's 7-day retention was the outage budget in D and E. Here, durability depends on the SDK's in-memory retry and the collector's sending queue.
+  - Give the collector a **persistent queue** (`file_storage`) and 2+ replicas behind an internal load balancer. A full collector or Elasticsearch outage beyond the queue loses logs.
+- **Predictor → collector path.**
+  - Each predictor needs OTLP egress to the collector (an authenticated Cloud Run URL or an internal LB on a VPC the endpoint can reach). This is unverified for public Vertex endpoints.
+  - Transport is **OTLP over HTTP on port 4318** (`http/protobuf`); gRPC (4317) isn't used. Model env vars:
+    - `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`
+    - `OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector-host>:4318`
+  - The SDK appends `/v1/logs` and `/v1/metrics`. The collector's `otlp` receiver enables only `protocols.http` (endpoint `0.0.0.0:4318`).
+  - Every predictor image needs the OTel SDK (`opentelemetry-exporter-otlp-proto-http`).
+- **Grafana stays on-prem.**
+  - R5 is partly kept: the same Grafana and alerting, but metrics come from Elasticsearch rather than Prometheus/Thanos, so there's **no PromQL**.
+  - Elasticsearch must expose an HTTPS endpoint to on-prem: Cloud Armor allow-list plus team-scoped API keys. This is the single firewall entry.
+- **PII travels further.**
+  - Log content leaves GCP on every Grafana query (rendered results only, not bulk egress).
+  - Per-team indices and API keys keep R3.
+
+| Pros | Cons |
+|---|---|
+| One pipeline and one store; no sink, Pub/Sub or Loki | **No managed buffer**: outage tolerance depends on the collector queue, not 7 days of Pub/Sub |
+| Existing on-prem Grafana, one firewall entry | Code change in **every predictor** (OTel SDK for logs); platform-level failures before the SDK starts aren't captured |
+| Little or no Cloud Logging cost if container logging is disabled | Metrics lose PromQL/Thanos; Elasticsearch becomes the metrics store too |
+| Structured, consistent log schema from the SDK | Vertex → collector egress unverified; Elasticsearch publicly reachable (behind Cloud Armor) |
+
 ---
 
 ## 5. Evaluation
